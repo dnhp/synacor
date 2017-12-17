@@ -6,6 +6,15 @@ const MEM_CAPACITY: usize = 32768;
 const MAX_15_BIT_VAL: u16 = 32767;
 const MAX_REG_ID: u16 = 7;
 
+// TODO:
+// - Consistent error handling - pass Err() upwards, use ?
+// - Pass new program counter as output of inc_pc()
+// - Standardise the checking of addresses for registers
+// - Make use of more idiomatic control flow expressions for assigning
+//   values, e.g. if let Some(), etc. Replace let mut val_1 etc.
+// - Write opcode 20 to read from stdin
+// - break_at_cc -> usize, not u64
+// - Add checks for invalid numbers > 32775
 
 pub struct CPU {
     // 8 registers holding 16-bit values. This

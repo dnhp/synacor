@@ -8,7 +8,7 @@ use std::io::Read;
 fn main() {
 
     // Read little-endian bytes from file into buffer
-    let mut f = File::open("../challenge.bin").unwrap();
+    let mut f = File::open("/home/dave/proj/synacor/challenge.bin").unwrap();
     let mut buf = Vec::new();
     f.read_to_end(&mut buf).unwrap();
 
