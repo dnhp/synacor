@@ -1,3 +1,7 @@
+use std::io;
+use std::fs::File;
+use std::io::Write;
+
 const MOD: u16 = 32768;
 const MAX_ADDR: u16 = 32775;
 const MAX_VALID_VAL: u16 = 32775;
@@ -7,14 +11,17 @@ const MAX_15_BIT_VAL: u16 = 32767;
 const MAX_REG_ID: u16 = 7;
 
 // TODO:
-// - Consistent error handling - pass Err() upwards, use ?
+// - Consistent error handling - pass Err() upwards, use ?,
+//   get rid of lazy unwrap()s unless it makes sense to panic
 // - Pass new program counter as output of inc_pc()
 // - Standardise the checking of addresses for registers
 // - Make use of more idiomatic control flow expressions for assigning
 //   values, e.g. if let Some(), etc. Replace let mut val_1 etc.
 // - Write opcode 20 to read from stdin
-// - break_at_cc -> usize, not u64
 // - Add checks for invalid numbers > 32775
+// - Write binary -> assembly translator, replacing opcodes and registers
+//   with names, and ascii codes with letters where appropriate
+// - Wrap little-endian > big-endian conversion into own module
 
 pub struct CPU {
     // 8 registers holding 16-bit values. This
@@ -34,15 +41,24 @@ pub struct CPU {
     pc: u16,
 
     // Cycle counter
-    cc: u64,
+    cc: u32,
 
+    // Execution halt flag
     halt: bool,
 
-    // Breakpoint at cycle count
+    // Flag for enabling/disabling setting a breakpoint at
+    // a specific cycle count
     break_at_cc: bool,
 
-    // Breakpoint at program counter
+    // Flag for enabling/disabling setting a breakpoint at
+    // a specific program counter
     break_at_pc: bool,
+
+    input_buffer: String,
+
+    logging: bool,
+
+    logfile: File,
 }
 
 impl CPU {
@@ -56,6 +72,9 @@ impl CPU {
             cc: 0,
             break_at_cc: false,
             break_at_pc: false,
+            input_buffer: String::new(),
+            logging: false,
+            logfile: File::create("inst_log.txt").unwrap(),
         }
     }
 
@@ -134,6 +153,31 @@ impl CPU {
         Ok(())
     }
 
+    fn mem_dump (&self, minus: usize, plus: usize) {
+        println!("Dumping mem from pc-{:?}={:?} to pc+{:?}={:?}\nCurrent pc: {:?}",
+            minus, self.pc - minus as u16,
+            plus, self.pc + plus as u16,
+            self.pc);
+
+        println!("{:?}", 
+            self.mem.iter()
+                .skip((self.pc as usize)-minus).take(minus + plus + 1)
+                .collect::<Vec<_>>());
+    }
+
+    fn reg_dump (&self) {
+        println!("Dumping registers at pc={:?}", self.pc);
+        println!("{:?}", self.reg);
+    }
+
+
+    fn get_reg (&mut self, reg_id: u16) -> Result<u16, &'static str> {
+        if reg_id > MAX_REG_ID {
+            return Err("Register ID larger than 7.");
+        }
+        Ok(self.reg[reg_id as usize])
+    }
+
 
     fn get_instr (&mut self) -> Result<(), &'static str> {
     // This function reads the next instruction from memory, matches
@@ -206,11 +250,15 @@ impl CPU {
                 19 => { 
                     self.out().unwrap();
                 },
-                20 => { /* IN a */ self.halt = true;println!("Unknown opcode {:?}", opcd);},
+                20 => { /* IN a */ 
+                    self.in_stdin().unwrap();
+                },
                 21 => { /* NO-OP */ self.inc_pc();},
                 _ => {
                     self.halt = true;
                     println!("Unrecognised instruction: {:?}", opcd);
+                    self.mem_dump(5,10);
+                    self.reg_dump();
                     return Err("Unrecognised instruction.");
                 }, 
 
@@ -220,7 +268,12 @@ impl CPU {
         Ok(())
     }
 
+    /* opcodes */
+
     fn set (&mut self) -> Result<(), &'static str> {
+        // This function sets a given register to a given value
+        // SET a b
+
         self.inc_pc();
         let pc = self.pc;
         let reg_id = self.mem_read(pc)? % MOD;
@@ -243,6 +296,11 @@ impl CPU {
 
         //println!("Setting register {:?} to {:?}", reg_id, value);
         self.inc_pc();
+
+        if self.logging {
+            write!(self.logfile, "set r{} {}\n", reg_id, value).unwrap();
+        }
+
         Ok(())
     }
 
@@ -250,6 +308,7 @@ impl CPU {
     fn push (&mut self) -> Result<(), &'static str> {
         // This function pushes a value onto the stack
         // and increments the stack pointer
+        // PUSH a
 
         // Get value to push
         self.inc_pc();
@@ -261,11 +320,20 @@ impl CPU {
             // Refers to a value in register instead
             let reg_id = val % MOD;
             val = self.get_reg(reg_id).unwrap();
+            if self.logging {
+                write!(self.logfile, "push r{}\n", reg_id).unwrap();
+            }
+        }
+        else {
+            if self.logging {
+                write!(self.logfile, "push {}\n", val).unwrap();
+            }
         }
         //println!("Pushing val: {:?} onto stack", val);
         self.stack.push(val);
 
         self.inc_pc();
+
         Ok(())
     }
 
@@ -274,6 +342,7 @@ impl CPU {
         // This function pops the value from the top of the stack
         // and writes it to memory.
         // If nothing on the stack, then it panics.
+        // POP a
 
         // Get destination to write the result to
         self.inc_pc();
@@ -283,25 +352,26 @@ impl CPU {
 
         if let Some(val) = self.stack.pop() {
             self.mem_write(dest, val).unwrap();
-            //println!("Popped val {:?} off stack to dest {:?}", val, dest);
+            if self.logging {
+                write!(self.logfile, "pop {}\n", dest).unwrap();
+            }
         }
         else {
             return Err("Tried to pop off an empty stack!");
         }
 
         self.inc_pc();
+
+        
+
         Ok(())
     }
 
 
-    fn get_reg (&mut self, reg_id: u16) -> Result<u16, &'static str> {
-        if reg_id > MAX_REG_ID {
-            return Err("Register ID larger than 7.");
-        }
-        Ok(self.reg[reg_id as usize])
-    }
-
     fn eq (&mut self) -> Result<(), &'static str>{
+        // This function sets <a> to 1 if <b> is equal to <c>;
+        // set it to 0 otherwise
+        // EQ a b c
 
         // Get destination to write the result to
         self.inc_pc();
@@ -333,14 +403,11 @@ impl CPU {
             val_2 = self.get_reg(reg_id).unwrap();
         }
 
-        let result = if val_1 == val_2 {
-            1
+        self.mem_write(dest, (val_1==val_2) as u16).unwrap();
+
+        if self.logging {
+            write!(self.logfile, "eq {} {} {}\n", dest, val_1, val_2).unwrap();
         }
-        else {
-            0
-        };
-        //println!("Eq: Writing {:?} == {:?} to dest: {:?}", val_1, val_2, dest);
-        self.mem_write(dest, result).unwrap();
 
         self.inc_pc();
 
@@ -349,6 +416,8 @@ impl CPU {
 
 
     fn gt (&mut self) -> Result<(), &'static str>{
+        // set <a> to 1 if <b> is greater than <c>; set it to 0 otherwise
+        // GT a b c
 
         // Get destination to write the result to
         self.inc_pc();
@@ -391,11 +460,243 @@ impl CPU {
 
         self.inc_pc();
 
+        if self.logging {
+            write!(self.logfile, "gt {} {} {}\n", dest, val_1, val_2).unwrap();
+        }
+
         Ok(())
     }
 
 
+    fn jmp (&mut self) -> Result<(), &'static str> {
+        // jump to <a>
+        // JMP a
+
+        self.inc_pc();
+        let pc = self.pc;
+        let addr = self.mem_read(pc)?;
+        if addr > MAX_MEM_ADDR {
+            return Err("Attempted to jump outside program memory");
+        }
+        //println!("Jumping to {:?}", addr);
+        self.set_pc(addr);
+
+        if self.logging {
+            write!(self.logfile, "jmp {}\n", addr).unwrap();
+        }
+
+        Ok(())
+    }
+
+
+    fn jt (&mut self) -> Result<(), &'static str> {
+        // if <a> is nonzero, jump to <b>
+        // JT a b
+
+        self.inc_pc();
+        let pc = self.pc;
+        let mut val_branch_if_nz = self.mem_read(pc)?;
+
+        if val_branch_if_nz > MAX_15_BIT_VAL {
+            // Refers to a value in register instead
+            let reg_id = val_branch_if_nz % MOD;
+            val_branch_if_nz = self.get_reg(reg_id).unwrap();
+        }
+
+        self.inc_pc();
+        let pc = self.pc;
+        let branch_addr = self.mem_read(pc)?;
+        if val_branch_if_nz != 0 {
+            //println!("JT Branching to {:?} val: {:?}, pc: {:?}", branch_addr, val_branch_if_nz, pc);
+            self.set_pc(branch_addr);
+        }
+        else {
+            //println!("JT Didn't branch: addr: {:?}, val: {:?}", branch_addr, val_branch_if_nz);
+            self.inc_pc();
+        }
+
+        if self.logging {
+            write!(self.logfile, "jt {} {}\n", val_branch_if_nz, branch_addr).unwrap();
+        }
+
+        Ok(())
+    }
+
+    fn jf (&mut self) -> Result<(), &'static str> {
+        //   if <a> is zero, jump to <b>
+        // JF a b
+
+        self.inc_pc();
+        let pc = self.pc;
+
+        let mut val_branch_if_z = self.mem_read(pc)?;
+
+        if val_branch_if_z > MAX_15_BIT_VAL {
+            // Refers to a value in register instead
+            let reg_id = val_branch_if_z % MOD;
+            val_branch_if_z = self.get_reg(reg_id).unwrap();
+        }
+
+        self.inc_pc();
+        let pc = self.pc;
+        let branch_addr = self.mem_read(pc)?;
+
+        if val_branch_if_z == 0 {
+            self.set_pc(branch_addr);
+            //println!("JF Branching to {:?}, val: {:?}", branch_addr, val_branch_if_z);
+        }
+        else {
+            //println!("JF didn't branch. Addr: {:?}, val: {:?}", branch_addr, val_branch_if_z);
+            self.inc_pc();
+        }
+
+        if self.logging {
+            write!(self.logfile, "jf {} {}\n", val_branch_if_z, branch_addr).unwrap();
+        }
+
+        Ok(())
+    }
+
+
+    fn add (&mut self) -> Result<(), &'static str> {
+        // assign into <a> the sum of <b> and <c> (modulo 32768)
+        // ADD a b c
+
+        self.inc_pc();
+        let pc = self.pc;
+
+        // Get destination address to write to
+        let dest = self.mem_read(pc)?;
+
+        self.inc_pc();
+        let pc = self.pc;
+
+        // Read first value from memory, read
+        // from register if >32767
+        
+        let mut val_1 = self.mem_read(pc)?;
+        if val_1 > MAX_15_BIT_VAL {
+            // Value is in a register
+            let reg_id = val_1 % MOD;
+            val_1 = self.get_reg(reg_id).unwrap();
+        }
+
+        self.inc_pc();
+        let pc = self.pc;
+
+        // Read second value from memory, read
+        // from register if >32767
+        let mut val_2 = self.mem_read(pc)?;
+        if val_2 > MAX_15_BIT_VAL {
+            // Value is in a register
+            let reg_id = val_2 % MOD;
+            val_2 = self.get_reg(reg_id).unwrap();
+        }
+        //println!("Add: Writing {:?} + {:?} to dest: {:?}", val_1, val_2, dest);
+        self.mem_write(dest, (val_1 + val_2) % MOD)?;
+
+        self.inc_pc();
+
+        if self.logging {
+            write!(self.logfile, "add {} {} {}\n", dest, val_1, val_2).unwrap();
+        }
+
+        Ok(())
+    }
+
+
+    fn mult (&mut self) -> Result<(), &'static str> {
+        // store into <a> the product of <b> and <c> (modulo 32768)
+        // MULT a b c
+
+        self.inc_pc();
+        let pc = self.pc;
+
+        let dest = self.mem_read(pc)?;
+
+        self.inc_pc();
+        let pc = self.pc;
+
+        // Read first value from memory, read
+        // from register if >32767
+        let mut val_1 = self.mem_read(pc)?;
+        if val_1 > MAX_15_BIT_VAL {
+            // Value is in a register
+            let reg_id = val_1 % MOD;
+            val_1 = self.get_reg(reg_id).unwrap();
+        }
+
+        self.inc_pc();
+        let pc = self.pc;
+
+        // Read second value from memory, read
+        // from register if >32767
+        let mut val_2 = self.mem_read(pc)?;
+        if val_2 > MAX_15_BIT_VAL {
+            // Value is in a register
+            let reg_id = val_2 % MOD;
+            val_2 = self.get_reg(reg_id).unwrap();
+        }
+        //println!("Mult: Writing {:?} * {:?} to dest: {:?}", val_1, val_2, dest);
+        self.mem_write(dest, ((val_1 as u32 * val_2 as u32 ) % MOD as u32) as u16)?;
+
+        self.inc_pc();
+
+        if self.logging {
+            write!(self.logfile, "mult {} {} {}\n", dest, val_1, val_2).unwrap();
+        }
+
+        Ok(())
+    }
+
+    fn modulo (&mut self) -> Result<(), &'static str> {
+        // store into <a> the remainder of <b> divided by <c>
+        // MOD a b c
+
+        self.inc_pc();
+        let pc = self.pc;
+
+        let dest = self.mem_read(pc)?;
+
+        self.inc_pc();
+        let pc = self.pc;
+
+        // Read first value from memory, read
+        // from register if >32767
+        let mut val_1 = self.mem_read(pc)?;
+        if val_1 > MAX_15_BIT_VAL {
+            // Value is in a register
+            let reg_id = val_1 % MOD;
+            val_1 = self.get_reg(reg_id).unwrap();
+        }
+
+        self.inc_pc();
+        let pc = self.pc;
+
+        // Read second value from memory, read
+        // from register if >32767
+        let mut val_2 = self.mem_read(pc)?;
+        if val_2 > MAX_15_BIT_VAL {
+            // Value is in a register
+            let reg_id = val_2 % MOD;
+            val_2 = self.get_reg(reg_id).unwrap();
+        }
+        //println!("Mod: Writing {:?} % {:?} to dest: {:?}", val_1, val_2, dest);
+
+        self.mem_write(dest, val_1 % val_2)?;
+
+        self.inc_pc();
+
+        if self.logging {
+            write!(self.logfile, "mod {} {} {}\n", dest, val_1, val_2).unwrap();
+        }
+
+        Ok(())
+    }
+
     fn and (&mut self) -> Result<(), &'static str>{
+        // stores into <a> the bitwise and of <b> and <c>
+        // AND a b c
 
         // Get destination to write the result to
         self.inc_pc();
@@ -434,11 +735,17 @@ impl CPU {
 
         self.inc_pc();
 
+        if self.logging {
+            write!(self.logfile, "and {} {} {}\n", dest, val_1, val_2).unwrap();
+        }
+
         Ok(())
     }
 
 
     fn or (&mut self) -> Result<(), &'static str>{
+        // stores into <a> the bitwise or of <b> and <c>
+        // OR a b c 
 
         // Get destination to write the result to
         self.inc_pc();
@@ -477,11 +784,17 @@ impl CPU {
 
         self.inc_pc();
 
+        if self.logging {
+            write!(self.logfile, "or {} {} {}\n", dest, val_1, val_2).unwrap();
+        }
+
         Ok(())
     }
 
 
     fn not (&mut self) -> Result<(), &'static str>{
+        // stores 15-bit bitwise inverse of <b> in <a>
+        // NOT a b
 
         // Get destination to write the result to
         self.inc_pc();
@@ -510,11 +823,18 @@ impl CPU {
 
         self.inc_pc();
 
+        if self.logging {
+            write!(self.logfile, "not {} {}\n", dest, val).unwrap();
+        }
+
         Ok(())
     }
 
 
     fn rmem (&mut self) -> Result<(), &'static str> {
+        // read memory at address <b> and write it to <a>
+        // RMEM a b
+
         //let pc = self.pc;
         //println!("Mem dump at pc = {:?}: {:?}", pc, self.mem.iter().skip(pc as usize).take(30).collect::<Vec<_>>());
         
@@ -540,7 +860,8 @@ impl CPU {
         // Read value from source address
         let val = self.mem_read(src_addr)?;
         if val > MAX_15_BIT_VAL {
-            panic!("RMEM: Register contained another register");
+            return Err("RMEM: Register contained another register's address.
+                     Probably not valid.");
         }
 
         // Write this value to destination
@@ -548,11 +869,19 @@ impl CPU {
 
         //println!("RMEM: Reading from addr {:?} val {:?} and writing to addr {:?}", src_addr, val, dest_addr);
         self.inc_pc();
+
+        if self.logging {
+            write!(self.logfile, "rmem {} {}\n", dest_addr, val).unwrap();
+        }
+
         Ok(())
     }
 
 
     fn wmem (&mut self) -> Result<(), &'static str> {
+        // write the value from <b> into memory at address <a>
+        // WMEM a b
+
         //let pc = self.pc;
         //println!("Mem dump at pc = {:?}: {:?}", pc-2, self.mem.iter().skip(pc as usize - 2).take(30).collect::<Vec<_>>());
         
@@ -593,14 +922,18 @@ impl CPU {
         //println!("WMEM: Writing value {:?} to {:?}", val, dest_addr);
         
         self.inc_pc();
+
+        if self.logging {
+            write!(self.logfile, "wmem {} {}\n", dest_addr, val).unwrap();
+        }
+
         Ok(())
     }
 
 
     fn call (&mut self) -> Result<(), &'static str> {
-        // This function pushes the address of the next
-        // instruction onto the stack, then jumps to the
-        // address given.
+        // write the address of the next instruction to the stack and jump to <a>.
+        // CALL a
 
         // Get destination to jump to
         self.inc_pc();
@@ -625,13 +958,18 @@ impl CPU {
         // Set the program counter to the location to jump
         self.pc = jump_to_addr;
 
+        if self.logging {
+            write!(self.logfile, "call {}\n", jump_to_addr).unwrap();
+        }
+
         Ok(())
     }
 
 
     fn ret (&mut self) -> Result<(), &'static str> {
-        // This function pops a result off the stack and
-        // jumps to it.
+        // remove the top element from the stack and jump to it; empty stack = halt
+        // RET
+
         if self.stack.is_empty() {
             self.halt = true;
             println!("RET: Halting at empty stack");
@@ -639,210 +977,27 @@ impl CPU {
         }
         else {
             let ret_addr = self.stack.pop().unwrap();
-            
-            
-            //let pc = self.pc;
-            //println!("Mem dump at pc = {:?}: {:?}", pc, self.mem.iter().skip(pc as usize).take(30).collect::<Vec<_>>());
-            
 
             // Set the program counter to the location to jump
             self.pc = ret_addr;
 
-            /*println!("RET: Popped addr {:?} from stack and jumped to it", ret_addr);
-            let pc = self.pc;
-            println!("Mem dump at pc = {:?}, CC: {:?}: {:?}", 
-                pc, self.cc, self.mem.iter().skip(pc as usize).take(30).collect::<Vec<_>>());
-            println!("Reg dump: {:?}", self.reg);*/
-            //panic!();
+            if self.logging {
+                write!(self.logfile, "ret to {}\n", ret_addr).unwrap();
+            }
 
-            
             return Ok(());
         }
     }
 
 
-    fn jmp (&mut self) -> Result<(), &'static str> {
-        self.inc_pc();
-        let pc = self.pc;
-        let addr = self.mem_read(pc)?;
-        if addr > MAX_MEM_ADDR {
-            return Err("Attempted to jump outside program memory");
-        }
-        //println!("Jumping to {:?}", addr);
-        self.set_pc(addr);
-        Ok(())
-    }
-
-
-    fn jt (&mut self) -> Result<(), &'static str> {
-        // Branches to addr if non-zero
-        self.inc_pc();
-        let pc = self.pc;
-        let mut val_branch_if_nz = self.mem_read(pc)?;
-
-        if val_branch_if_nz > MAX_15_BIT_VAL {
-            // Refers to a value in register instead
-            let reg_id = val_branch_if_nz % MOD;
-            val_branch_if_nz = self.get_reg(reg_id).unwrap();
-        }
-
-        self.inc_pc();
-        let pc = self.pc;
-        let branch_addr = self.mem_read(pc)?;
-        if val_branch_if_nz != 0 {
-            //println!("JT Branching to {:?} val: {:?}, pc: {:?}", branch_addr, val_branch_if_nz, pc);
-            self.set_pc(branch_addr);
-        }
-        else {
-            //println!("JT Didn't branch: addr: {:?}, val: {:?}", branch_addr, val_branch_if_nz);
-            self.inc_pc();
-        }
-        Ok(())
-    }
-
-    fn jf (&mut self) -> Result<(), &'static str> {
-        // Branches to addr if zero
-        self.inc_pc();
-        let pc = self.pc;
-
-        let mut val_branch_if_z = self.mem_read(pc)?;
-
-        if val_branch_if_z > MAX_15_BIT_VAL {
-            // Refers to a value in register instead
-            let reg_id = val_branch_if_z % MOD;
-            val_branch_if_z = self.get_reg(reg_id).unwrap();
-        }
-
-        self.inc_pc();
-        let pc = self.pc;
-        let branch_addr = self.mem_read(pc)?;
-
-        if val_branch_if_z == 0 {
-            self.set_pc(branch_addr);
-            //println!("JF Branching to {:?}, val: {:?}", branch_addr, val_branch_if_z);
-        }
-        else {
-            //println!("JF didn't branch. Addr: {:?}, val: {:?}", branch_addr, val_branch_if_z);
-            self.inc_pc();
-        }
-        Ok(())
-    }
-
-
-    fn add (&mut self) -> Result<(), &'static str> {
-        self.inc_pc();
-        let pc = self.pc;
-
-        // Get destination address to write to
-        let dest = self.mem_read(pc)?;
-
-        self.inc_pc();
-        let pc = self.pc;
-
-        // Read first value from memory, read
-        // from register if >32767
-        
-        let mut val_1 = self.mem_read(pc)?;
-        if val_1 > MAX_15_BIT_VAL {
-            // Value is in a register
-            let reg_id = val_1 % MOD;
-            val_1 = self.get_reg(reg_id).unwrap();
-        }
-
-        self.inc_pc();
-        let pc = self.pc;
-
-        // Read second value from memory, read
-        // from register if >32767
-        let mut val_2 = self.mem_read(pc)?;
-        if val_2 > MAX_15_BIT_VAL {
-            // Value is in a register
-            let reg_id = val_2 % MOD;
-            val_2 = self.get_reg(reg_id).unwrap();
-        }
-        //println!("Add: Writing {:?} + {:?} to dest: {:?}", val_1, val_2, dest);
-        self.mem_write(dest, (val_1 + val_2) % MOD)?;
-
-        self.inc_pc();
-        Ok(())
-    }
-
-
-    fn mult (&mut self) -> Result<(), &'static str> {
-        self.inc_pc();
-        let pc = self.pc;
-
-        let dest = self.mem_read(pc)?;
-
-        self.inc_pc();
-        let pc = self.pc;
-
-        // Read first value from memory, read
-        // from register if >32767
-        let mut val_1 = self.mem_read(pc)?;
-        if val_1 > MAX_15_BIT_VAL {
-            // Value is in a register
-            let reg_id = val_1 % MOD;
-            val_1 = self.get_reg(reg_id).unwrap();
-        }
-
-        self.inc_pc();
-        let pc = self.pc;
-
-        // Read second value from memory, read
-        // from register if >32767
-        let mut val_2 = self.mem_read(pc)?;
-        if val_2 > MAX_15_BIT_VAL {
-            // Value is in a register
-            let reg_id = val_2 % MOD;
-            val_2 = self.get_reg(reg_id).unwrap();
-        }
-        //println!("Mult: Writing {:?} * {:?} to dest: {:?}", val_1, val_2, dest);
-        self.mem_write(dest, ((val_1 as u32 * val_2 as u32 ) % MOD as u32) as u16)?;
-
-        self.inc_pc();
-        Ok(())
-    }
-
-    fn modulo (&mut self) -> Result<(), &'static str> {
-        self.inc_pc();
-        let pc = self.pc;
-
-        let dest = self.mem_read(pc)?;
-
-        self.inc_pc();
-        let pc = self.pc;
-
-        // Read first value from memory, read
-        // from register if >32767
-        let mut val_1 = self.mem_read(pc)?;
-        if val_1 > MAX_15_BIT_VAL {
-            // Value is in a register
-            let reg_id = val_1 % MOD;
-            val_1 = self.get_reg(reg_id).unwrap();
-        }
-
-        self.inc_pc();
-        let pc = self.pc;
-
-        // Read second value from memory, read
-        // from register if >32767
-        let mut val_2 = self.mem_read(pc)?;
-        if val_2 > MAX_15_BIT_VAL {
-            // Value is in a register
-            let reg_id = val_2 % MOD;
-            val_2 = self.get_reg(reg_id).unwrap();
-        }
-        //println!("Mod: Writing {:?} % {:?} to dest: {:?}", val_1, val_2, dest);
-
-        self.mem_write(dest, val_1 % val_2)?;
-
-        self.inc_pc();
-        Ok(())
-    }
-
-
     fn out (&mut self) -> Result<(), &'static str> {
+        // write the character represented by ascii code <a> to the terminal
+        // OUT a
+        // if self.logging {
+        //     self.logging = false;
+        //     println!("Disabling instruction logging");
+        // }
+        
         self.inc_pc();
         let pc = self.pc;
 
@@ -857,51 +1012,113 @@ impl CPU {
 
         if val > 255 {
             self.halt = true;
-                println!("Error at program counter = {:?}, CC = {:?}", self.pc, self.cc);
-                println!("Register dump: {:?}", self.reg);
-                let pc = self.pc;
-                println!("Mem dump at pc = {:?}: {:?}", 
-                    pc, self.mem.iter().skip(pc as usize).take(30).collect::<Vec<_>>());
+                println!("ERROR: Invalid ASCII code: {:?}", val);
+                self.mem_dump(5,10);
+                self.reg_dump();
             return Err("Number too large, cannot be ascii.");
         }
         print!("{}", (val as u8) as char);
+
+        if self.logging {
+            write!(self.logfile, "out {}\n", (val as u8) as char).unwrap();
+        }
+
         self.inc_pc();
         Ok(())
     }
 
-    pub fn run (&mut self, break_at_cc: u64, break_at_pc: u16) {
+    fn in_stdin (&mut self) -> Result<(), &'static str> {
+        // read character from stdin and write ascii code to <a>
+        // IN a
+        
+        // Get destination to write the result to
+        self.inc_pc();
+        let pc = self.pc;
 
-        if break_at_cc != 0 {
+        let dest = self.mem_read(pc)?;
+
+        // Check if there are still characters in buffer to be read.
+        // If not, then read string from stdin to fill buffer
+        if self.input_buffer.is_empty() {
+            io::stdin().read_line(&mut self.input_buffer).unwrap();
+        }
+
+        if self.input_buffer == "DUMP\n" {
+            println!("PC: {:?}", self.pc);
+            self.reg_dump();
+            self.mem_dump(0,10);
+            let mut buf = File::create("memdump.txt").unwrap();
+            for i in 0..self.mem.len() {
+                write!(buf,"{}\n", self.mem[i]).unwrap();
+            }
+            
+        }
+        else if self.input_buffer == "LOG_START\n" {
+            println!("Enabling instruction logging");
+            self.logging = true;
+            self.input_buffer.clear();
+            io::stdin().read_line(&mut self.input_buffer).unwrap();
+        }
+        else if self.input_buffer == "LOG_END\n" {
+            println!("Disabling instruction logging");
+            self.logging = false;
+            self.input_buffer.clear();
+            io::stdin().read_line(&mut self.input_buffer).unwrap();
+        }
+        else if self.input_buffer == "FIX\n" {
+            println!("Setting r7 to 5");
+            self.reg[7] = 5;
+            self.input_buffer.clear();
+            io::stdin().read_line(&mut self.input_buffer).unwrap();
+        }
+
+
+        
+
+        // Read first character in buffer and write to <a>, then remove
+        let ch = self.input_buffer.remove(0);
+
+        if ch as u16 > 127 {
+            return Err("Invalid ASCII code");
+        } 
+        
+        self.mem_write(dest, ch as u16).unwrap();
+        self.inc_pc();
+        Ok(())
+    }
+
+    pub fn run (&mut self, breakpoint_cc: u32, breakpoint_pc: u16) {
+
+        if breakpoint_cc != 0 {
             self.break_at_cc = true;
         }
-        if break_at_pc != 0 {
+        if breakpoint_pc != 0 {
             self.break_at_pc = true;
         }
 
         while !self.halt {
             match self.get_instr() {
                 Ok(()) => {},
-                Err(msg) => {println!("{:?}", msg);}
+                Err(msg) => {
+                    println!("{:?}", msg);
+                    break;
+                }
             }
             self.cc += 1;
 
             // Debug
-            if self.cc == break_at_cc && self.break_at_cc {
+            if self.cc == breakpoint_cc && self.break_at_cc {
                 self.halt = true;
                 println!("Breakpoint at cycle count = {:?}", self.cc);
-                println!("Register dump: {:?}", self.reg);
-                let pc = self.pc;
-                println!("Mem dump at pc = {:?}: {:?}", 
-                    pc, self.mem.iter().skip(pc as usize).take(30).collect::<Vec<_>>());
+                self.mem_dump(5,10);
+                self.reg_dump();
             }
 
-            if self.pc == break_at_pc && self.break_at_pc {
+            if self.pc == breakpoint_pc && self.break_at_pc {
                 self.halt = true;
                 println!("Breakpoint at program counter = {:?}", self.pc);
-                println!("Register dump: {:?}", self.reg);
-                let pc = self.pc;
-                println!("Mem dump at pc = {:?}: {:?}", 
-                    pc, self.mem.iter().skip(pc as usize).take(30).collect::<Vec<_>>());
+                self.mem_dump(5,10);
+                self.reg_dump();
             }
         }
     }

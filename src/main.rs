@@ -1,10 +1,7 @@
-//extern crate cpu;
-
 mod cpu;
-extern crate byteorder;
 use cpu::CPU;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read,self};
 fn main() {
 
     // Read little-endian bytes from file into buffer
@@ -22,12 +19,10 @@ fn main() {
     // Instantiate CPU and load program into memory
     let mut cpu = CPU::new();
     if let Err(msg) = cpu.load_mem(data) {
-        println!("Load memory returned error: {:?}", msg);
+        println!("Load memory returned error: {:?}" , msg);
         panic!();
     }
     
-    //let breakpoint_cc = 695861;
-    // let breakpoint_cc = 286;
     let breakpoint_cc = 0;
     let breakpoint_pc = 0;
 
