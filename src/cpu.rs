@@ -2,12 +2,12 @@ use std::io;
 use std::fs::File;
 use std::io::Write;
 
-const MOD: u16 = 32768;
-const MAX_ADDR: u16 = 32775;
-const MAX_VALID_VAL: u16 = 32775;
-const MAX_MEM_ADDR: u16 = 32767;
-const MEM_CAPACITY: usize = 32768;
-const MAX_15_BIT_VAL: u16 = 32767;
+const MOD: u16 = 32_768;
+const MAX_ADDR: u16 = 32_775;
+const MAX_VALID_VAL: u16 = 32_775;
+const MAX_MEM_ADDR: u16 = 32_767;
+const MEM_CAPACITY: usize = 32_768;
+const MAX_15_BIT_VAL: u16 = 32_767;
 const MAX_REG_ID: u16 = 7;
 
 // TODO:
@@ -78,17 +78,22 @@ impl CPU {
         }
     }
 
-    pub fn load_mem (&mut self, mem_input: Vec<u16>) -> Result<(), &'static str> {
-        if mem_input.len() == 0 {
+    pub fn load_mem (&mut self, mem_input: &[u16]) -> Result<(), &'static str> {
+        if mem_input.is_empty() {
             return Err("No memory loaded.");
         }
         else if mem_input.len() > MEM_CAPACITY {
             return Err("Attempted to load memory larger than capacity.");
         }
 
-        for ind in 0..mem_input.len() {
-            self.mem[ind] = mem_input[ind];
-        }
+        // for ind in 0..mem_input.len() {
+        //     self.mem[ind] = mem_input[ind];
+        // }
+
+
+        // self.mem = mem_input.to_vec();
+        self.mem[..mem_input.len()].clone_from_slice(&mem_input[..]);
+
         Ok(())
     }
 
@@ -638,7 +643,7 @@ impl CPU {
             val_2 = self.get_reg(reg_id).unwrap();
         }
         //println!("Mult: Writing {:?} * {:?} to dest: {:?}", val_1, val_2, dest);
-        self.mem_write(dest, ((val_1 as u32 * val_2 as u32 ) % MOD as u32) as u16)?;
+        self.mem_write(dest, ((u32::from(val_1) * u32::from(val_2)) % u32::from(MOD)) as u16)?;
 
         self.inc_pc();
 
@@ -973,7 +978,7 @@ impl CPU {
         if self.stack.is_empty() {
             self.halt = true;
             println!("RET: Halting at empty stack");
-            return Err("Ret: Empty stack");
+            Err("Ret: Empty stack")
         }
         else {
             let ret_addr = self.stack.pop().unwrap();
@@ -985,7 +990,7 @@ impl CPU {
                 write!(self.logfile, "ret to {}\n", ret_addr).unwrap();
             }
 
-            return Ok(());
+            Ok(())
         }
     }
 

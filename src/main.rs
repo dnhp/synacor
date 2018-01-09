@@ -1,7 +1,7 @@
 mod cpu;
 use cpu::CPU;
 use std::fs::File;
-use std::io::{Read,self};
+use std::io::Read;
 fn main() {
 
     // Read little-endian bytes from file into buffer
@@ -13,12 +13,12 @@ fn main() {
     // big endian values to be loaded into CPU memory
     let mut data = vec![0; buf.len()/2];
     for i in 0..data.len() {
-        data[i] = buf[2*i] as u16 | (buf[2*i+1] as u16) << 8;
+        data[i] = u16::from(buf[2*i]) | u16::from(buf[2*i+1]) << 8;
     }
 
     // Instantiate CPU and load program into memory
     let mut cpu = CPU::new();
-    if let Err(msg) = cpu.load_mem(data) {
+    if let Err(msg) = cpu.load_mem(&data) {
         println!("Load memory returned error: {:?}" , msg);
         panic!();
     }
